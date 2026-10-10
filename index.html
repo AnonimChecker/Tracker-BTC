@@ -109,6 +109,14 @@ td a:hover{color:var(--accent);border-color:var(--accent)}
 .tag.dep{background:var(--bad);color:var(--bg)}
 .tag.wd{background:var(--ok);color:var(--bg)}
 .flow-dep{color:var(--bad)} .flow-wd{color:var(--ok)}
+.tag.lrn{background:transparent;border:1px dashed currentColor}
+.tag.dep.lrn{color:var(--bad)} .tag.wd.lrn{color:var(--ok)} .tag.lb.lrn{color:var(--muted)}
+.flows{width:100%;border-collapse:collapse;min-width:0}
+.flows th,.flows td{padding:7px 14px}
+.flows td{font-size:12.5px}
+.netbar{display:inline-block;height:6px;border-radius:3px;vertical-align:middle;margin-left:6px}
+.learn-stats{display:flex;flex-wrap:wrap;gap:6px 14px;font:12px var(--mono);color:var(--muted)}
+.learn-stats b{color:var(--fg);font-weight:600}
 .form{display:flex;flex-direction:column;gap:10px;padding:12px 14px}
 .form .row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
 .form label.f{display:flex;flex-direction:column;gap:4px;font-size:11.5px;color:var(--muted);flex:1;min-width:140px}
@@ -219,6 +227,18 @@ footer a{color:var(--muted)}
         <div class="empty" id="whalesEmpty">Belum ada transaksi di atas batas sejak halaman dibuka.</div>
       </section>
 
+      <section class="panel" aria-label="Arus exchange">
+        <div class="panel-head"><h2 class="grow">Arus exchange</h2><span class="count" id="flowSince">sejak halaman dibuka</span></div>
+        <div style="overflow-x:auto">
+          <table class="flows">
+            <thead><tr><th>Exchange</th><th class="r">Masuk</th><th class="r">Keluar</th><th class="r">Net</th></tr></thead>
+            <tbody id="flowBody"></tbody>
+          </table>
+        </div>
+        <div class="empty" id="flowEmpty">Belum ada deposit atau penarikan exchange yang terdeteksi.</div>
+        <div class="note" style="padding:0 14px 12px">Masuk = deposit ke exchange (sering untuk dijual). Keluar = penarikan dari exchange (sering setelah membeli). Net positif berarti lebih banyak BTC masuk ke exchange.</div>
+      </section>
+
       <section class="panel" aria-label="Blok terbaru">
         <div class="panel-head"><h2 class="grow">Blok terbaru</h2><span class="count" id="nextBlk">—</span></div>
         <div class="blocks" id="blocks"><div class="empty" style="grid-column:1/-1">Memuat blok…</div></div>
@@ -269,6 +289,15 @@ footer a{color:var(--muted)}
           <div class="row"><label class="chk" for="lblEx"><input type="checkbox" id="lblEx" checked> Ini alamat exchange</label><span style="flex:1"></span><button class="btn" type="submit">Tambah label</button></div>
           <div id="lblErr" class="badmsg" hidden></div>
         </form>
+        <div class="form" style="border-top:1px solid var(--line)">
+          <div class="row">
+            <label class="chk" for="learnOn"><input type="checkbox" id="learnOn" checked> Pelajari alamat exchange otomatis</label>
+            <span style="flex:1"></span>
+            <button class="btn" type="button" id="learnReset">Hapus hasil belajar</button>
+          </div>
+          <div class="learn-stats" id="learnStats"></div>
+          <div class="note">Saat sebuah transaksi mengirim seluruh isinya ke wallet exchange yang sudah dikenal (pola "sweep"), alamat pengirimnya dicatat sebagai alamat milik exchange itu. Alamat hasil belajar ditandai dengan garis putus-putus dan tersimpan di browser ini. Ini perkiraan, bukan kepastian.</div>
+        </div>
         <ul class="list" id="lblList"></ul>
       </details>
     </div>
@@ -412,7 +441,9 @@ footer a{color:var(--muted)}
     const rate = vbytes ? fee / vbytes : 0;
     const now = Date.now();
     const watched = [...addrs].filter(a => state.watch.has(a));
+    learnFromTx(x, inAddrs);
     const flow = detectFlow(x, inAddrs, outAddrs);
+    recordFlow(flow);
     const tx = { hash:x.hash, t:now, btc, fee, rate, nIn:(x.inputs||[]).length, nOut:(x.out||[]).length, whale: btc >= state.whaleMin, watched, flow };
     notifyTx(tx);
 
@@ -432,17 +463,95 @@ footer a{color:var(--muted)}
 
   // ---------- labels & exchange flow ----------
   let customLabels = store.get("labels", {});
-  const labelOf = a => customLabels[a] || PUBLIC_LABELS[a] || null;
+  // Learned exchange addresses: addr -> {name, ex, hop, t, learned}
+  let learned = store.get("learned", {});
+  let learnOn = store.get("learnOn", true);
+  const LEARN_CAP = 20000, MAX_HOP = 2;
+  let learnedCount = Object.keys(learned).length, learnedSession = 0, learnDirty = false;
+  const labelOf = a => customLabels[a] || PUBLIC_LABELS[a] || learned[a] || null;
+  const hopOf = l => l.learned ? (l.hop || 1) : 0;
+
+  // Sweep heuristic: a tx whose every output goes to one known exchange is the exchange
+  // consolidating its own funds, so its unlabeled input addresses belong to that exchange.
+  function learnFromTx(x, inAddrs){
+    if (!learnOn) return;
+    const outs = (x.out || []).filter(o => (o.value || 0) > 0);
+    if (!outs.length || !inAddrs.size) return;
+    let ent = null, hop = 0;
+    for (const o of outs) {
+      const l = o.addr && labelOf(o.addr);
+      if (!l || !l.ex) return;
+      if (ent && l.name !== ent) return;
+      ent = l.name; hop = Math.max(hop, hopOf(l));
+    }
+    if (hop + 1 > MAX_HOP) return;
+    const now = Date.now();
+    for (const a of inAddrs) {
+      if (labelOf(a)) continue;
+      learned[a] = {name: ent, ex: true, hop: hop + 1, t: now, learned: true};
+      learnedCount++; learnedSession++; learnDirty = true;
+    }
+  }
+  function saveLearned(){
+    if (!learnDirty) return;
+    learnDirty = false;
+    let keys = Object.keys(learned);
+    if (keys.length > LEARN_CAP) {
+      keys.sort((a, b) => learned[a].t - learned[b].t);
+      for (const k of keys.slice(0, keys.length - LEARN_CAP)) delete learned[k];
+      learnedCount = Object.keys(learned).length;
+    }
+    store.set("learned", learned);
+  }
+  setInterval(saveLearned, 10000);
+  addEventListener("pagehide", () => { learnDirty = true; saveLearned(); });
+
   function detectFlow(x, inAddrs, outAddrs){
     let from = null;
     for (const a of inAddrs) { const l = labelOf(a); if (l) { from = l; break; } }
-    let to = null, toSat = 0;
-    for (const o of x.out || []) { const l = o.addr && labelOf(o.addr); if (l) { if (!to) to = l; if (l.name === to.name) toSat += o.value || 0; } }
-    if (from && to && from.name === to.name) return {kind:"int", name:from.name, ex:from.ex};
-    if (to) return {kind: to.ex ? "dep" : "to", name:to.name, ex:to.ex, btc: toSat / 1e8};
-    if (from) return {kind: from.ex ? "wd" : "from", name:from.name, ex:from.ex};
+    // "to" = first labeled output entity that is not the sender itself (change back to the sender is ignored)
+    let to = null, toSat = 0, outsideSat = 0;
+    for (const o of x.out || []) {
+      const l = o.addr && labelOf(o.addr);
+      if (from && l && l.name === from.name) continue;
+      outsideSat += o.value || 0;
+      if (l && (!to || l.name === to.name)) { to = to || l; toSat += o.value || 0; }
+    }
+    if (to) return {kind: to.ex ? "dep" : "to", name:to.name, ex:to.ex, btc: toSat / 1e8, learned: !!to.learned};
+    if (from) {
+      if (outsideSat === 0) return {kind:"int", name:from.name, ex:from.ex, learned: !!from.learned};
+      return {kind: from.ex ? "wd" : "from", name:from.name, ex:from.ex, btc: outsideSat / 1e8, learned: !!from.learned};
+    }
     return null;
   }
+
+  // Per-exchange inflow/outflow since page load
+  const flowStats = {};
+  function recordFlow(f){
+    if (!f || !f.ex || (f.kind !== "dep" && f.kind !== "wd")) return;
+    const s = flowStats[f.name] || (flowStats[f.name] = {inn:0, out:0, nIn:0, nOut:0});
+    if (f.kind === "dep") { s.inn += f.btc || 0; s.nIn++; } else { s.out += f.btc || 0; s.nOut++; }
+  }
+  function renderFlows(){
+    const rows = Object.entries(flowStats).sort((a, b) => (b[1].inn + b[1].out) - (a[1].inn + a[1].out));
+    const body = $("flowBody"); body.textContent = "";
+    const maxNet = Math.max(1e-8, ...rows.map(([, s]) => Math.abs(s.inn - s.out)));
+    for (const [name, s] of rows) {
+      const tr = el("tr");
+      tr.appendChild(el("td", null, name));
+      const tIn = el("td", "r flow-dep", fmtBtc(s.inn)); tIn.title = s.nIn + " deposit"; tr.appendChild(tIn);
+      const tOut = el("td", "r flow-wd", fmtBtc(s.out)); tOut.title = s.nOut + " penarikan"; tr.appendChild(tOut);
+      const net = s.inn - s.out;
+      const tdN = el("td", "r " + (net > 0 ? "flow-dep" : net < 0 ? "flow-wd" : "muted"), (net > 0 ? "+" : "") + fmtBtc(net));
+      const bar = el("span", "netbar"); bar.style.width = Math.max(2, Math.abs(net) / maxNet * 40) + "px";
+      bar.style.background = net > 0 ? "var(--bad)" : "var(--ok)";
+      tdN.appendChild(bar);
+      tr.appendChild(tdN);
+      body.appendChild(tr);
+    }
+    $("flowEmpty").hidden = rows.length > 0;
+  }
+  setInterval(renderFlows, 2000);
   function flowText(f){
     if (!f) return "";
     return f.kind === "dep" ? "Deposit ke " + f.name
@@ -451,9 +560,9 @@ footer a{color:var(--muted)}
          : f.kind === "to"  ? "Ke " + f.name : "Dari " + f.name;
   }
   function flowTag(f){
-    const cls = f.kind === "dep" ? "tag dep" : f.kind === "wd" ? "tag wd" : "tag lb";
+    const cls = (f.kind === "dep" ? "tag dep" : f.kind === "wd" ? "tag wd" : "tag lb") + (f.learned ? " lrn" : "");
     const t = el("span", cls, f.kind === "dep" ? "→ " + f.name : f.kind === "wd" ? f.name + " →" : f.name);
-    t.title = flowText(f);
+    t.title = flowText(f) + (f.learned ? " (alamat hasil belajar otomatis)" : "");
     return t;
   }
 
@@ -502,9 +611,10 @@ footer a{color:var(--muted)}
     if (!(tg.on && tg.token && tg.chat)) return;
     const big = tx.btc >= tg.min;
     const isFlow = tx.flow && (tx.flow.kind === "dep" || tx.flow.kind === "wd");
-    if (big && tg.flow && isFlow) {
-      tgEnqueue((tx.flow.kind === "dep" ? "🔴 <b>Deposit ke " : "🟢 <b>Penarikan dari ") + esc(tx.flow.name) + "</b>\n" +
-        fmtBtc(tx.btc) + " BTC" + usdText(tx.btc) + "\n" + txLink(tx.hash));
+    const flowAmt = isFlow ? (tx.flow.btc || tx.btc) : 0;
+    if (isFlow && tg.flow && flowAmt >= tg.min) {
+      tgEnqueue((tx.flow.kind === "dep" ? "🔴 <b>Deposit ke " : "🟢 <b>Penarikan dari ") + esc(tx.flow.name) + "</b>" + (tx.flow.learned ? " <i>(alamat dipelajari)</i>" : "") + "\n" +
+        fmtBtc(flowAmt) + " BTC" + usdText(flowAmt) + "\n" + txLink(tx.hash));
     } else if (big && tg.whale) {
       tgEnqueue("🐋 <b>Whale " + fmtBtc(tx.btc) + " BTC</b>" + usdText(tx.btc) + "\n" +
         (tx.flow ? esc(flowText(tx.flow)) + "\n" : "") + tx.nIn + " input → " + tx.nOut + " output\n" + txLink(tx.hash));
@@ -553,8 +663,26 @@ footer a{color:var(--muted)}
       li.appendChild(el("div", "small r", l.ex ? "exchange" : "entitas"));
       ul.appendChild(li);
     }
-    $("lblCount").textContent = Object.keys(PUBLIC_LABELS).length + " publik · " + Object.keys(customLabels).length + " milik Anda";
+    $("lblCount").textContent = Object.keys(PUBLIC_LABELS).length + " publik · " + Object.keys(customLabels).length + " milik Anda · " + nf(learnedCount) + " dipelajari";
   }
+  function renderLearnStats(){
+    const by = {};
+    for (const k in learned) by[learned[k].name] = (by[learned[k].name] || 0) + 1;
+    const box = $("learnStats"); box.textContent = "";
+    const head = el("span"); head.append("Total "); head.appendChild(el("b", null, nf(learnedCount))); head.append(" alamat · +" + nf(learnedSession) + " sesi ini");
+    box.appendChild(head);
+    for (const [n, c] of Object.entries(by).sort((a, b) => b[1] - a[1])) { const s = el("span"); s.append(n + " "); s.appendChild(el("b", null, nf(c))); box.appendChild(s); }
+    $("lblCount").textContent = Object.keys(PUBLIC_LABELS).length + " publik · " + Object.keys(customLabels).length + " milik Anda · " + nf(learnedCount) + " dipelajari";
+  }
+  setInterval(renderLearnStats, 5000);
+  $("learnOn").checked = learnOn;
+  $("learnOn").addEventListener("change", e => { learnOn = e.target.checked; store.set("learnOn", learnOn); });
+  let resetArmed = false;
+  $("learnReset").addEventListener("click", e => {
+    if (!resetArmed) { resetArmed = true; e.currentTarget.textContent = "Klik lagi untuk menghapus"; setTimeout(() => { resetArmed = false; $("learnReset").textContent = "Hapus hasil belajar"; }, 4000); return; }
+    resetArmed = false; e.currentTarget.textContent = "Hapus hasil belajar";
+    learned = {}; learnedCount = 0; learnedSession = 0; store.set("learned", learned); renderLearnStats();
+  });
   $("lblForm").addEventListener("submit", e => {
     e.preventDefault();
     const a = $("lblAddr").value.trim(), n = $("lblName").value.trim(), err = $("lblErr");
@@ -808,7 +936,7 @@ footer a{color:var(--muted)}
   addEventListener("resize", draw);
 
   // ---------- boot ----------
-  renderLabels();
+  renderLabels(); renderLearnStats(); renderFlows();
   loadPrice(); loadFees(); loadMempool(); loadBlocks(); connect(); draw();
   setInterval(loadPrice, 60000); setInterval(loadFees, 30000); setInterval(loadMempool, 30000); setInterval(loadBlocks, 120000);
 })();
